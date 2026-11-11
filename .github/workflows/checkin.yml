@@ -1,11 +1,17 @@
 name: NewAPI 自动签到
 
 on:
-  # 提前在北京时间 07:50 启动准备；实际签到在 08:00—09:00 内随机执行
+  # 北京时间 07:50 启动，08:00—09:00 随机签到；延迟时立即补签
   schedule:
     - cron: '50 23 * * *'
+    # 北京时间 18:37 再次兜底；当天已签到会正常返回
+    - cron: '37 10 * * *'
   # 手动触发
   workflow_dispatch:
+
+concurrency:
+  group: daily-checkin
+  cancel-in-progress: false
 
 jobs:
   checkin:
@@ -32,8 +38,7 @@ jobs:
           google-chrome --version
           which xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
 
-      - name: 随机等待至北京时间 08:00—09:00（手动运行立即执行）
-        id: window
+      - name: 早晨随机等待，延迟时立即补签
         shell: bash
         run: |
           node <<'NODE'
@@ -41,38 +46,35 @@ jobs:
           const { randomInt } = require('node:crypto');
           
           async function main() {
-            const scheduled = process.env.GITHUB_EVENT_NAME === 'schedule';
-            let runCheckin = true;
-            if (scheduled) {
+            let note;
+            if (process.env.GITHUB_EVENT_NAME === 'schedule') {
               const now = Date.now();
               const hour = 60 * 60 * 1000;
               const day = 24 * hour;
               const offset = 8 * hour;
               const start = Math.floor((now + offset) / day) * day - offset + 8 * hour;
               const end = start + hour;
-              if (now >= end) {
-                console.log('已超过北京时间 09:00，跳过今天的定时签到。');
-                runCheckin = false;
-              } else {
+              if (now < end) {
                 const target = randomInt(Math.max(now, start), end);
                 const beijingTime = new Date(target + offset).toISOString().slice(0, 19).replace('T', ' ');
-                console.log(`随机签到时间（北京时间）：${beijingTime}`);
+                note = `计划签到时间（北京时间）：${beijingTime}；如等待或调度延迟则立即补签。`;
+                console.log(note);
                 await new Promise(resolve => setTimeout(resolve, Math.max(0, target - Date.now())));
-                const actual = Date.now();
-                runCheckin = actual >= start && actual < end;
-                if (!runCheckin) console.log('等待结束时已超出 08:00—09:00，跳过今天的定时签到。');
+              } else {
+                note = '已超过北京时间 09:00：立即执行当天补签，不再跳过。';
+                console.log(note);
               }
             } else {
-              console.log('手动运行：立即签到。');
+              note = '手动运行：立即签到。';
+              console.log(note);
             }
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, `run_checkin=${runCheckin}\n`);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${note}\n\n`);
           }
           
           main().catch(error => { console.error(error); process.exitCode = 1; });
           NODE
 
       - name: 执行签到（xvfb 虚拟显示，含 Turnstile 解验证）
-        if: steps.window.outputs.run_checkin == 'true'
         env:
           CONFIG_URL: ${{ secrets.CONFIG_URL }}
           CONFIG_AUTH: ${{ secrets.CONFIG_AUTH }}
@@ -86,4 +88,17 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-        run: xvfb-run --auto-servernum python checkin.py
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "签到尝试 $attempt/3"
+            if xvfb-run --auto-servernum python checkin.py; then
+              echo "✅ 签到脚本执行成功（包含今日已签到），详情见日志。" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 60))
+            fi
+          done
+          echo "❌ 连续三次签到失败，请检查站点与凭证；晚间兜底任务仍会再次尝试。" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
